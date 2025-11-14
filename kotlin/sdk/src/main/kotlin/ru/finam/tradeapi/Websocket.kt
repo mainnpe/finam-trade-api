@@ -8,6 +8,7 @@ import com.fasterxml.jackson.module.kotlin.KotlinModule
 import com.google.protobuf.Message
 import com.google.protobuf.util.JsonFormat
 import com.google.protobuf.util.Timestamps
+import grpc.tradeapi.v1.auth.AuthServiceGrpcKt
 import grpc.tradeapi.v1.marketdata.TimeFrame
 import io.grpc.ManagedChannelBuilder
 import io.ktor.client.*
@@ -17,12 +18,16 @@ import io.ktor.client.request.*
 import io.ktor.http.*
 import io.ktor.websocket.*
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.channelFlow
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import java.time.Instant
 import java.util.*
+import kotlin.properties.Delegates
 
-val logger: Logger = LoggerFactory.getLogger("WebSocket.kt")
+val logger: Logger = LoggerFactory.getLogger("ru.finam.tradeapi.WebSocket.kt")
 val mapper: ObjectMapper = ObjectMapper().apply {
     disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
     registerModule(KotlinModule.Builder().build())
@@ -30,70 +35,80 @@ val mapper: ObjectMapper = ObjectMapper().apply {
 }
 
 class WebsocketClient(
-    private val host: String = "api.finam.ru",
-    private val port: Int = 443,
-    private val endpoint: String = "/ws/trading-info",
-    private val secret: String,
+    private val defaultClientOptions: ClientOptions = defaultClientOptions(),
     parentScope: CoroutineScope? = null
 ) {
     private val client = HttpClient(CIO) {
         install(WebSockets)
     }
     private val scope = parentScope ?: CoroutineScope(Dispatchers.IO)
-    private val authStub = ManagedChannelBuilder
-        .forAddress(host, port)
-        .build().let { channel -> authServiceStub(channel) }
+    private var authStub: AuthServiceGrpcKt.AuthServiceCoroutineStub by Delegates.notNull<AuthServiceGrpcKt.AuthServiceCoroutineStub>()
     private var token: String? = null
     private var tokenRenewalJob: Job? = null
-    private var session: DefaultClientWebSocketSession? = null
 
-    suspend fun connect(awaitHandshake: CompletableDeferred<Unit>, onMessage: (String) -> Unit = {}) {
-        token = authStub.auth(secret).token
-        tokenRenewalJob = startTokenRenewal()
+    suspend fun connect(
+        host: String = defaultClientOptions.host,
+        port: Int = defaultClientOptions.port,
+        endpoint: String = defaultClientOptions.endpoint,
+        secret: String = defaultClientOptions.secret
+    ): WsSession {
+        authStub = authServiceStub(ManagedChannelBuilder.forAddress(host, port).build())
+        token = withTimeout(10_000) { authStub.auth(secret).token }
+        logger.debug("Auth token received")
+        tokenRenewalJob = startTokenRenewal(secret)
 
-        session = client.webSocketSession(
+        val session = client.webSocketSession(
             urlString = "wss://$host:$port$endpoint",
         ) {
             header(HttpHeaders.Authorization, token)
         }
 
-        for (frame in session!!.incoming) {
-            when (frame) {
-                is Frame.Text -> {
-                    val text = frame.readText()
-                    if (isHandshake(text)) {
-                        awaitHandshake.complete(Unit)
-                    } else {
-                        onMessage(text)
+        val incoming: Flow<String> = channelFlow {
+            for (frame in session.incoming) {
+                when (frame) {
+                    is Frame.Text -> {
+                        val text = frame.readText()
+                        logger.trace("Received text frame: {}", text)
+                        send(text)
                     }
-                }
 
-                is Frame.Close -> {
-                    logger.info("Connection was closed")
-                }
+                    is Frame.Close -> {
+                        logger.info("Connection was closed")
+                    }
 
-                else -> logger.error("Unsupported frame type ${frame.frameType}")
+                    else -> logger.error("Unsupported frame type ${frame.frameType}")
+                }
+            }
+            awaitClose {
+                logger.debug("Incoming message flow closed")
             }
         }
-    }
 
-    suspend fun writeText(payload: WsRequest) {
-        if (session == null) {
-            throw IllegalStateException("No websocket session has been established")
+        val send: suspend (WsRequest) -> Unit = { req ->
+            if (token == null) {
+                throw IllegalStateException("Authentication token not found")
+            }
+            session.outgoing.send(Frame.Text(mapper.writeValueAsString(req.copy(token = token!!))))
         }
-        if (token == null) {
-            throw IllegalStateException("Authentication token not found")
+
+        val close: suspend () -> Unit = {
+            tokenRenewalJob?.cancelAndJoin()
+            if (session.isActive) session.close(CloseReason(CloseReason.Codes.NORMAL, "client close"))
+            logger.info("Websocket session closed")
         }
-        session!!.outgoing.send(Frame.Text(mapper.writeValueAsString(payload.copy(token = token!!))))
+
+        return WsSession(incoming, send, close)
     }
 
-    suspend fun close(code: Short = CloseReason.Codes.NORMAL.code, reason: String = "Client close") {
-        tokenRenewalJob?.cancelAndJoin()
-        session?.close(CloseReason(code, reason))
-        session = null
-    }
+    suspend fun connect(options: ClientOptions) = connect(
+        host = options.host,
+        port = options.port,
+        endpoint = options.endpoint,
+        secret = options.secret
+    )
 
-    private fun startTokenRenewal() = scope.launch {
+    private fun startTokenRenewal(secret: String) = scope.launch {
+        logger.debug("Token renewal started")
         authStub.subscribeJwtRenewal(secret).collect {
             token = it.token
             val tokenDetails = authStub.tokenDetails(it.token)
@@ -105,6 +120,21 @@ class WebsocketClient(
     }
 
 }
+
+private fun defaultClientOptions() = ClientOptions()
+
+data class ClientOptions(
+    val host: String = "api.finam.ru",
+    val port: Int = 443,
+    val endpoint: String = "/ws/trading-info",
+    val secret: String = ""
+)
+
+data class WsSession(
+    val incoming: Flow<String>,
+    val send: suspend (WsRequest) -> Unit,
+    val close: suspend () -> Unit
+)
 
 data class WsRequest(
     val action: Action,

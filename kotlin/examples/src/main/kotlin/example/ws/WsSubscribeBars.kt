@@ -3,17 +3,19 @@ package example.ws
 import example.FINAM_SECRET_KEY
 import grpc.tradeapi.v1.marketdata.SubscribeBarsResponse
 import grpc.tradeapi.v1.marketdata.TimeFrame
-import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.*
+import org.slf4j.Logger
+import org.slf4j.LoggerFactory
 import ru.finam.tradeapi.*
 import kotlin.time.Duration.Companion.seconds
 
+
 object WsSubscribeBars {
+
+    private val logger: Logger = LoggerFactory.getLogger(WsSubscribeBars::class.java)
 
     @JvmStatic
     fun main(args: Array<String>) = runBlocking {
-        System.setProperty("logback.configurationFile", "/logback.xml")
         val secret = System.getenv(FINAM_SECRET_KEY)
         if (secret.isNullOrEmpty()) {
             throw IllegalStateException("$FINAM_SECRET_KEY env is not set")
@@ -22,39 +24,48 @@ object WsSubscribeBars {
         val subscribeRequest = WsRequest.subscribeBarsRequest(symbol, TimeFrame.TIME_FRAME_D)
         val unsubscribeRequest = subscribeRequest.copy(action = Action.UNSUBSCRIBE)
 
-        val client = WebsocketClient(secret = secret)
+        val client = WebsocketClient()
         val handshakeReceived = CompletableDeferred<Unit>()
 
-        client.connect(handshakeReceived) { message ->
-            val envelope = parseEnv(message) ?: throw RuntimeException("Failed to parse envelope $message")
+        val session = client.connect(secret = secret)
 
-            when (envelope.type) {
-                MessageType.DATA -> {
-                    if (envelope.subscriptionType == SubscriptionType.BARS) {
-                        val barsResponse: SubscribeBarsResponse? = parseProto(
-                            message,
-                            { SubscribeBarsResponse.newBuilder() })
-                        if (barsResponse == null) {
-                            println("Failed to deserialize bars: ${envelope.payload}")
-                        } else {
-                            println("Received bars for symbol: ${barsResponse.symbol}")
-                            barsResponse.barsList.forEach { bar ->
-                                println(bar)
+        val job = CoroutineScope(Dispatchers.IO).launch {
+            delay(500)
+            session.incoming.collect { message ->
+                if (isHandshake(message)) {
+                    handshakeReceived.complete(Unit)
+                }
+                val envelope = parseEnv(message) ?: throw RuntimeException("Failed to parse envelope $message")
+
+
+                when (envelope.type) {
+                    MessageType.DATA -> {
+                        if (envelope.subscriptionType == SubscriptionType.BARS) {
+                            val barsResponse: SubscribeBarsResponse? = parseProto(
+                                message,
+                                { SubscribeBarsResponse.newBuilder() })
+                            if (barsResponse == null) {
+                                logger.error("Failed to deserialize bars: ${envelope.payload}")
+                            } else {
+                                logger.info("Received bars: \n {}", barsResponse)
                             }
                         }
                     }
+
+                    MessageType.EVENT -> logger.info("Event received: ${envelope.eventInfo}")
+                    MessageType.ERROR -> logger.error("Error received: ${envelope.errorInfo}")
                 }
 
-                MessageType.EVENT -> println("Event received: ${envelope.eventInfo}")
-                MessageType.ERROR -> println("Error received: ${envelope.errorInfo}")
-            }
 
+            }
         }
 
         handshakeReceived.await()
-        client.writeText(subscribeRequest)
+        session.send(subscribeRequest)
         delay(30.seconds)
-        client.writeText(unsubscribeRequest)
-        client.close()
+        session.send(unsubscribeRequest)
+        session.close.invoke()
+        job.cancelAndJoin()
     }
+
 }
