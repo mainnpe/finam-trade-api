@@ -150,6 +150,13 @@ data class WsRequest(
                 "timeframe" to timeframe.name
             )
         )
+
+        fun subscribeOrderBookRequest(symbol: String) = WsRequest(
+            Action.SUBSCRIBE, SubscriptionType.ORDER_BOOK,
+            mapOf(
+                "symbol" to symbol
+            )
+        )
     }
 }
 
